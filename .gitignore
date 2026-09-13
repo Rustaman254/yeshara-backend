@@ -1,0 +1,13 @@
+# env files — real credentials (Mongo URI, admin token/password hash,
+# comet-engine API keys, payment callback secret) live in .env, never commit it
+.env
+.env.local
+.env.*.local
+
+# build artifacts
+/server
+/bin/
+*.exe
+
+# editor/OS
+.DS_Store
