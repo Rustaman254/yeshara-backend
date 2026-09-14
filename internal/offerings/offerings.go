@@ -8,6 +8,7 @@ package offerings
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -22,12 +23,28 @@ import (
 
 type Status string
 
+// The approval chain is four sequential, separately-authenticated seats —
+// see internal/staff.Role. Each status names whose desk the offering is
+// currently on; the transition functions below (ManagerAReview,
+// ManagerBReview, TrusteeAApprove, TrusteeBTokenize) are the only way to
+// move it forward, and each checks the offering is still on its own status
+// before doing anything — same atomic guard-then-update shape as
+// comet-engine's receipts.MarkVerified, so two concurrent actions on the
+// same offering can't both succeed.
 const (
-	StatusPendingApproval Status = "pending_approval" // deposited to comet-engine, awaiting verify
-	StatusLive            Status = "live"             // verified — units minted, open for investment
+	StatusPendingManagerA Status = "pending_manager_a" // submitted, awaiting Manager A's (maker) review
+	StatusPendingManagerB Status = "pending_manager_b" // Manager A cleared it, awaiting Manager B's (checker) countersign
+	StatusPendingTrusteeA Status = "pending_trustee_a" // Manager B cleared it, awaiting Trustee A's issuance approval
+	StatusPendingTrusteeB Status = "pending_trustee_b" // Trustee A approved, awaiting Trustee B to actually tokenize
+	StatusLive            Status = "live"              // Trustee B minted — units exist on-chain, open for investment
 	StatusRejected        Status = "rejected"
 	StatusClosed          Status = "closed" // manually closed or fully sold
 )
+
+// PendingStatuses is every status a staff review action can still move —
+// used both to build the "any pending stage" filter Reject needs and by
+// the API layer to map a staff.Role to the queue it should see.
+var PendingStatuses = []Status{StatusPendingManagerA, StatusPendingManagerB, StatusPendingTrusteeA, StatusPendingTrusteeB}
 
 type Offering struct {
 	ID                 primitive.ObjectID `bson:"_id,omitempty" json:"id"`
@@ -46,6 +63,11 @@ type Offering struct {
 	Chain              string             `bson:"chain" json:"chain"`
 	Symbol             string             `bson:"symbol,omitempty" json:"symbol,omitempty"`
 	ReceiptID          string             `bson:"receipt_id" json:"receiptId"`
+	// MintTxHash/MintTxURL are the comet-engine tx (and its ready-to-use
+	// block-explorer link) that minted this offering's units on-chain — set
+	// once, by TrusteeBTokenize. Empty until then.
+	MintTxHash string `bson:"mint_tx_hash,omitempty" json:"mintTxHash,omitempty"`
+	MintTxURL  string `bson:"mint_tx_url,omitempty" json:"mintTxUrl,omitempty"`
 	IssuerUserID       string             `bson:"issuer_user_id" json:"issuerUserId"`
 	Status             Status             `bson:"status" json:"status"`
 	CreatedAt          time.Time          `bson:"created_at" json:"createdAt"`
@@ -65,6 +87,33 @@ type Offering struct {
 	// from OwnerUserID: that's just the comet-engine wallet identity the
 	// reserve sits in, this is who's actually allowed to view it.
 	OwnerAccountID primitive.ObjectID `bson:"owner_account_id,omitempty" json:"ownerAccountId,omitempty"`
+
+	// Approval-chain audit trail — who (by staff email) cleared each stage
+	// and when. Populated one field at a time as the offering moves through
+	// ManagerAReview -> ManagerBReview -> TrusteeAApprove -> TrusteeBTokenize.
+	ManagerAReviewedBy   string     `bson:"manager_a_reviewed_by,omitempty" json:"managerAReviewedBy,omitempty"`
+	ManagerAReviewedAt   *time.Time `bson:"manager_a_reviewed_at,omitempty" json:"managerAReviewedAt,omitempty"`
+	ManagerBReviewedBy   string     `bson:"manager_b_reviewed_by,omitempty" json:"managerBReviewedBy,omitempty"`
+	ManagerBReviewedAt   *time.Time `bson:"manager_b_reviewed_at,omitempty" json:"managerBReviewedAt,omitempty"`
+	TrusteeAApprovedBy   string     `bson:"trustee_a_approved_by,omitempty" json:"trusteeAApprovedBy,omitempty"`
+	TrusteeAApprovedAt   *time.Time `bson:"trustee_a_approved_at,omitempty" json:"trusteeAApprovedAt,omitempty"`
+	TrusteeBTokenizedBy  string     `bson:"trustee_b_tokenized_by,omitempty" json:"trusteeBTokenizedBy,omitempty"`
+	TrusteeBTokenizedAt  *time.Time `bson:"trustee_b_tokenized_at,omitempty" json:"trusteeBTokenizedAt,omitempty"`
+
+	// RejectedBy/RejectedStage/RejectedReason record who killed the
+	// submission and at which desk it was sitting when they did — any of
+	// the four stages can reject, not just the last one.
+	RejectedBy     string `bson:"rejected_by,omitempty" json:"rejectedBy,omitempty"`
+	RejectedStage  string `bson:"rejected_stage,omitempty" json:"rejectedStage,omitempty"`
+	RejectedReason string `bson:"rejected_reason,omitempty" json:"rejectedReason,omitempty"`
+
+	// DelistedBy/At/Reason record a Delist call — the offering (and the
+	// on-chain asset, and every investor's existing holding) is untouched;
+	// this only stops it from being publicly listed/discoverable and
+	// accepting new investment. See Delist/Relist.
+	DelistedBy     string     `bson:"delisted_by,omitempty" json:"delistedBy,omitempty"`
+	DelistedAt     *time.Time `bson:"delisted_at,omitempty" json:"delistedAt,omitempty"`
+	DelistedReason string     `bson:"delisted_reason,omitempty" json:"delistedReason,omitempty"`
 
 	Details Details `bson:"details,omitempty" json:"details,omitempty"`
 }
@@ -133,9 +182,9 @@ type Stat struct {
 }
 
 var (
-	ErrNotFound      = errors.New("offerings: not found")
-	ErrSlugTaken     = errors.New("offerings: offeringId already in use")
-	ErrNotApprovable = errors.New("offerings: not pending approval")
+	ErrNotFound   = errors.New("offerings: not found")
+	ErrSlugTaken  = errors.New("offerings: offeringId already in use")
+	ErrWrongStage = errors.New("offerings: not at the expected approval stage")
 )
 
 func collection() *mongo.Collection { return database.GetDB().Collection("offerings") }
@@ -192,7 +241,7 @@ func Create(ctx context.Context, ce *cometengine.Client, in CreateInput) (*Offer
 		MinInvestmentUnits: in.MinInvestmentUnits, ExpectedYieldPct: in.ExpectedYieldPct,
 		RiskLevel: in.RiskLevel, Chain: in.Chain,
 		Symbol: receipt.Symbol, ReceiptID: receipt.ID, IssuerUserID: in.IssuerUserID,
-		Status: StatusPendingApproval, CreatedAt: now, UpdatedAt: now,
+		Status: StatusPendingManagerA, CreatedAt: now, UpdatedAt: now,
 		Details: in.Details,
 	}
 	res, err := collection().InsertOne(ctx, o)
@@ -206,9 +255,6 @@ func Create(ctx context.Context, ce *cometengine.Client, in CreateInput) (*Offer
 	return o, nil
 }
 
-// Approve verifies the underlying receipt — minting the full unit supply
-// to the issuer's treasury wallet in one on-chain transaction — and flips
-// the offering live.
 // ReservedOwnerPct is the fraction of a receipt's full minted supply set
 // aside for the real-world asset's original owner the moment it goes
 // live — "skin in the game" kept out of the public-sale pool from the
@@ -227,24 +273,76 @@ const ReservedOwnerPct = 0.20
 // tied to the same standard, not a growing piece of logic.
 const unitDecimals = 2
 
-// Approve verifies the underlying receipt — minting the full unit supply
-// to the issuer's treasury wallet in one on-chain transaction — flips the
-// offering live, and immediately transfers ReservedOwnerPct of that supply
-// out to a per-offering owner wallet, distinct from the shared public-sale
-// treasury identity. The reserve transfer is best-effort: if it fails, the
-// offering still goes live off the successful mint (same
-// needs-manual-reconciliation posture as ConfirmPayment) — ReservedUnits
-// stays 0 and ReserveTxHash stays empty so it's visibly unresolved rather
-// than silently wrong.
-func Approve(ctx context.Context, ce *cometengine.Client, id primitive.ObjectID, approvedBy string) (*Offering, string, error) {
+// advanceStage atomically moves an offering from `from` to `to`, merging in
+// setFields (the actor/timestamp columns for this stage) — the same
+// guard-then-update shape comet-engine's receipts.MarkVerified uses, so two
+// concurrent review calls on the same offering (a double-click, two staff
+// racing the same item) can't both succeed: the loser's UpdateOne matches
+// nothing and comes back ErrWrongStage instead of silently double-applying.
+func advanceStage(ctx context.Context, id primitive.ObjectID, from, to Status, setFields bson.M) (*Offering, error) {
+	setFields["status"] = to
+	setFields["updated_at"] = time.Now().UTC()
+	res, err := collection().UpdateOne(ctx, bson.M{"_id": id, "status": from}, bson.M{"$set": setFields})
+	if err != nil {
+		return nil, err
+	}
+	if res.MatchedCount == 0 {
+		return nil, ErrWrongStage
+	}
+	return Get(ctx, id)
+}
+
+// ManagerAReview is the maker's countersign: Manager A has looked at the
+// submission and forwards it to Manager B. Only valid from
+// StatusPendingManagerA.
+func ManagerAReview(ctx context.Context, id primitive.ObjectID, reviewedBy string) (*Offering, error) {
+	return advanceStage(ctx, id, StatusPendingManagerA, StatusPendingManagerB, bson.M{
+		"manager_a_reviewed_by": reviewedBy, "manager_a_reviewed_at": time.Now().UTC(),
+	})
+}
+
+// ManagerBReview is the checker's countersign: Manager B has independently
+// verified Manager A's review and forwards it to Trustee A. Only valid
+// from StatusPendingManagerB.
+func ManagerBReview(ctx context.Context, id primitive.ObjectID, reviewedBy string) (*Offering, error) {
+	return advanceStage(ctx, id, StatusPendingManagerB, StatusPendingTrusteeA, bson.M{
+		"manager_b_reviewed_by": reviewedBy, "manager_b_reviewed_at": time.Now().UTC(),
+	})
+}
+
+// TrusteeAApprove approves the issuing account for the property being
+// tokenized and forwards to Trustee B, who does the actual tokenization.
+// Only valid from StatusPendingTrusteeA.
+func TrusteeAApprove(ctx context.Context, id primitive.ObjectID, approvedBy string) (*Offering, error) {
+	return advanceStage(ctx, id, StatusPendingTrusteeA, StatusPendingTrusteeB, bson.M{
+		"trustee_a_approved_by": approvedBy, "trustee_a_approved_at": time.Now().UTC(),
+	})
+}
+
+// TrusteeBTokenize is the actual tokenization moment: Trustee B verifies
+// the underlying receipt — minting the full unit supply to the issuer's
+// treasury wallet in one on-chain transaction — flips the offering live,
+// and immediately transfers ReservedOwnerPct of that supply out to a
+// per-offering owner wallet, distinct from the shared public-sale treasury
+// identity. The reserve transfer is best-effort: if it fails, the offering
+// still goes live off the successful mint (same needs-manual-reconciliation
+// posture as ConfirmPayment) — ReservedUnits stays 0 and ReserveTxHash
+// stays empty so it's visibly unresolved rather than silently wrong.
+//
+// Only valid from StatusPendingTrusteeB — checked once before minting (so
+// a wrong-stage call fails fast without touching comet-engine) and again,
+// atomically, on the write that records the mint, so two concurrent calls
+// can't both flip the offering live even though the pre-check alone
+// couldn't prevent both from reaching comet-engine.
+func TrusteeBTokenize(ctx context.Context, ce *cometengine.Client, id primitive.ObjectID, tokenizedBy string) (*Offering, string, error) {
 	o, err := Get(ctx, id)
 	if err != nil {
 		return nil, "", err
 	}
-	if o.Status != StatusPendingApproval {
-		return nil, "", ErrNotApprovable
+	if o.Status != StatusPendingTrusteeB {
+		return nil, "", ErrWrongStage
 	}
-	txHash, err := ce.ApproveOffering(ctx, o.ReceiptID, approvedBy)
+	txHash, txURL, err := ce.ApproveOffering(ctx, o.ReceiptID, tokenizedBy)
 	if err != nil {
 		return nil, "", err
 	}
@@ -262,37 +360,112 @@ func Approve(ctx context.Context, ce *cometengine.Client, id primitive.ObjectID,
 	}
 
 	now := time.Now().UTC()
-	set := bson.M{"status": StatusLive, "updated_at": now, "owner_user_id": ownerID}
+	set := bson.M{
+		"status": StatusLive, "updated_at": now, "owner_user_id": ownerID,
+		"trustee_b_tokenized_by": tokenizedBy, "trustee_b_tokenized_at": now,
+	}
+	if txHash != "" {
+		set["mint_tx_hash"] = txHash
+		set["mint_tx_url"] = txURL
+	}
 	if reserveTxHash != "" {
 		set["reserved_units"] = reserved
 		set["reserve_tx_hash"] = reserveTxHash
 	}
-	_, err = collection().UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": set})
+	res, err := collection().UpdateOne(ctx, bson.M{"_id": id, "status": StatusPendingTrusteeB}, bson.M{"$set": set})
 	if err != nil {
 		return nil, txHash, err
 	}
-	o.Status = StatusLive
-	o.OwnerUserID = ownerID
-	if reserveTxHash != "" {
-		o.ReservedUnits = reserved
-		o.ReserveTxHash = reserveTxHash
+	if res.MatchedCount == 0 {
+		// Minted on-chain but the offering had already moved off
+		// pending_trustee_b by the time we tried to record it (a
+		// concurrent TrusteeBTokenize call, most likely) — surface this
+		// loudly rather than silently losing track of it, same posture as
+		// comet-engine's own mintReceipt/MarkVerified gap.
+		return nil, txHash, fmt.Errorf("offerings: minted on-chain (tx %s) but offering left pending_trustee_b before it could be recorded — needs manual reconciliation", txHash)
 	}
-	return o, txHash, nil
+	updated, err := Get(ctx, id)
+	return updated, txHash, err
 }
 
-func Reject(ctx context.Context, ce *cometengine.Client, id primitive.ObjectID, reason string) error {
+// Reject can happen from any of the four pending stages — the desk it was
+// sitting on when rejected is recorded in RejectedStage/RejectedBy so the
+// audit trail shows exactly where the chain stopped.
+func Reject(ctx context.Context, ce *cometengine.Client, id primitive.ObjectID, rejectedBy, stage, reason string) error {
 	o, err := Get(ctx, id)
 	if err != nil {
 		return err
 	}
-	if o.Status != StatusPendingApproval {
-		return ErrNotApprovable
+	isPending := false
+	for _, s := range PendingStatuses {
+		if o.Status == s {
+			isPending = true
+			break
+		}
+	}
+	if !isPending {
+		return ErrWrongStage
 	}
 	if err := ce.RejectOffering(ctx, o.ReceiptID, reason); err != nil {
 		return err
 	}
-	_, err = collection().UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"status": StatusRejected, "updated_at": time.Now().UTC()}})
-	return err
+	res, err := collection().UpdateOne(ctx, bson.M{"_id": id, "status": bson.M{"$in": PendingStatuses}}, bson.M{"$set": bson.M{
+		"status": StatusRejected, "updated_at": time.Now().UTC(),
+		"rejected_by": rejectedBy, "rejected_stage": stage, "rejected_reason": reason,
+	}})
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return ErrWrongStage
+	}
+	return nil
+}
+
+var ErrNotListed = errors.New("offerings: not currently live")
+var ErrNotDelisted = errors.New("offerings: not currently closed")
+
+// Delist takes a live offering off the public marketplace — sets it to
+// StatusClosed, which listLiveOfferings/getOffering already exclude from
+// public view. Deliberately not a deletion: the on-chain asset, its
+// mint/reserve tx history, and every investor's existing holding are
+// completely untouched — this only stops new discovery and new investment.
+func Delist(ctx context.Context, id primitive.ObjectID, delistedBy, reason string) (*Offering, error) {
+	now := time.Now().UTC()
+	res, err := collection().UpdateOne(ctx,
+		bson.M{"_id": id, "status": StatusLive},
+		bson.M{"$set": bson.M{
+			"status": StatusClosed, "updated_at": now,
+			"delisted_by": delistedBy, "delisted_at": now, "delisted_reason": reason,
+		}},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if res.MatchedCount == 0 {
+		return nil, ErrNotListed
+	}
+	return Get(ctx, id)
+}
+
+// Relist reverses a Delist — closed back to live, clearing the delisted_*
+// fields (a re-listing isn't "still delisted, with a reason on file", it's
+// current again). Does nothing to on-chain state, same as Delist.
+func Relist(ctx context.Context, id primitive.ObjectID) (*Offering, error) {
+	res, err := collection().UpdateOne(ctx,
+		bson.M{"_id": id, "status": StatusClosed},
+		bson.M{
+			"$set":   bson.M{"status": StatusLive, "updated_at": time.Now().UTC()},
+			"$unset": bson.M{"delisted_by": "", "delisted_at": "", "delisted_reason": ""},
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if res.MatchedCount == 0 {
+		return nil, ErrNotDelisted
+	}
+	return Get(ctx, id)
 }
 
 var ErrInvalidPrice = errors.New("offerings: newPricePerUnit must be positive")

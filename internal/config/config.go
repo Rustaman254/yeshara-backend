@@ -46,7 +46,7 @@ type Config struct {
 	PaymentsBaseURL        string
 	PaymentsMerchantID     string
 	PaymentsCallbackURL    string
-	PaymentsCallbackSecret string // optional — verifies X-Mamlaka-Signature when the account has signing enabled
+	PaymentsCallbackSecret string // required — verifies X-Mamlaka-Signature on every inbound callback (see payments.VerifySignature, which fails closed if this is ever empty)
 
 	// USDKESRate is a static, manually-updated conversion rate used only to
 	// quote KES amounts against offerings priced in USD — Yeshara has no
@@ -92,6 +92,16 @@ func Load() (*Config, error) {
 	}
 	if cfg.PaymentsMerchantID == "" || cfg.PaymentsCallbackURL == "" {
 		return nil, fmt.Errorf("PAYMENTS_MERCHANT_ID and PAYMENTS_CALLBACK_URL are required (gates M-Pesa/Airtel checkout)")
+	}
+	if cfg.PaymentsCallbackSecret == "" {
+		// Without this, VerifySignature would have nothing to check the
+		// inbound callback against — and POST /payments/mobile-money/callback
+		// is unauthenticated by design (Mamlaka can't hold an investor
+		// session), so an empty secret here means anyone who can guess or
+		// intercept a PaymentRef can POST a forged "COMPLETE" callback and
+		// have units minted to them for free. Must be set in every
+		// environment, not just recommended.
+		return nil, fmt.Errorf("PAYMENTS_CALLBACK_SECRET is required (verifies inbound mobile-money callbacks — without it, anyone can forge a payment confirmation)")
 	}
 	if v := os.Getenv("USD_KES_RATE"); v != "" {
 		rate, err := strconv.ParseFloat(v, 64)

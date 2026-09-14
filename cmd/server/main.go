@@ -22,6 +22,7 @@ import (
 	"yeshara.network/marketplace/internal/offerings"
 	"yeshara.network/marketplace/internal/owners"
 	"yeshara.network/marketplace/internal/redemptions"
+	"yeshara.network/marketplace/internal/staff"
 )
 
 func main() {
@@ -54,6 +55,9 @@ func main() {
 	}
 	if err := owners.EnsureIndexes(ctx); err != nil {
 		log.Fatalf("owner indexes: %v", err)
+	}
+	if err := staff.EnsureIndexes(ctx); err != nil {
+		log.Fatalf("staff indexes: %v", err)
 	}
 
 	srv := api.NewServer(cfg)

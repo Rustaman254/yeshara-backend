@@ -11,6 +11,8 @@ package investments
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -91,8 +93,17 @@ func PlaceOrder(ctx context.Context, offeringID, investorID primitive.ObjectID, 
 	return inv, nil
 }
 
+// generatePaymentRef must be unguessable, not just unique: it's the
+// externalId a forged POST /payments/mobile-money/callback would need to
+// name to fake-confirm someone else's order (see mobileMoneyCallback — the
+// HMAC signature is the primary defense, but a guessable ref made a nanosecond-
+// timestamp-based one brute-forceable within the same second regardless).
+// 8 random bytes is 64 bits of entropy, the same order of magnitude as the
+// 32-byte session tokens elsewhere in this codebase use crypto/rand for.
 func generatePaymentRef() string {
-	return fmt.Sprintf("YSH-%d", time.Now().UnixNano()%1_000_000_000)
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "YSH-" + hex.EncodeToString(b)
 }
 
 // ConfirmPayment is the operator action fulfilling an order: transfers

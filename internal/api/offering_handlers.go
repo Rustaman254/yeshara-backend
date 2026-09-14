@@ -62,24 +62,30 @@ func (s *Server) listLiveOfferings(c *gin.Context) {
 // on-chain balance of the offering's symbol — decreases as investments are
 // confirmed, so this is never stale the way a cached "unitsSold" counter
 // could be).
+//
+// Public visibility is intentionally restricted to StatusLive: an asset
+// still moving through the Manager A/B -> Trustee A/B chain (or rejected,
+// or delisted) isn't discoverable here even by someone who already has its
+// slug — same 404 either way, so a probing request can't distinguish "no
+// such offering" from "exists but isn't approved yet." listLiveOfferings
+// (the marketplace grid) already filtered to live-only; this closes the
+// same gap on direct-by-slug access to the detail endpoint.
 func (s *Server) getOffering(c *gin.Context) {
 	o, err := offerings.GetByOfferingID(c.Request.Context(), c.Param("offeringId"))
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	if err != nil || o.Status != offerings.StatusLive {
+		c.JSON(http.StatusNotFound, gin.H{"error": "offering not found"})
 		return
 	}
 
 	resp := gin.H{"offering": o}
-	if o.Status == offerings.StatusLive {
-		available, err := s.ce.AssetBalance(c.Request.Context(), o.Symbol, o.Chain, s.cfg.TreasuryUserID)
-		if err == nil {
-			publicPool := o.TotalUnits - o.ReservedUnits
-			sold := publicPool - available
-			resp["availableUnits"] = available
-			resp["unitsSold"] = sold
-			if publicPool > 0 {
-				resp["fundedPct"] = sold / publicPool * 100
-			}
+	available, err := s.ce.AssetBalance(c.Request.Context(), o.Symbol, o.Chain, s.cfg.TreasuryUserID)
+	if err == nil {
+		publicPool := o.TotalUnits - o.ReservedUnits
+		sold := publicPool - available
+		resp["availableUnits"] = available
+		resp["unitsSold"] = sold
+		if publicPool > 0 {
+			resp["fundedPct"] = sold / publicPool * 100
 		}
 	}
 	if kes, err := amountInKES(o.PricePerUnit, o.Currency, s.cfg.USDKESRate); err == nil {
@@ -141,53 +147,58 @@ func (s *Server) listAllOfferings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"offerings": list, "count": len(list)})
 }
 
-func (s *Server) approveOffering(c *gin.Context) {
+// Offering approval is no longer a single admin action — see
+// internal/api/staff_handlers.go's staffReview/staffReject, gated by the
+// four-seat Manager A/B -> Trustee A/B chain in internal/offerings.
+
+// delistOffering handles POST /api/v1/admin/offerings/:offeringId/delist —
+// takes a live offering off the public marketplace (getOffering/
+// listLiveOfferings both already exclude anything that isn't StatusLive).
+// The on-chain asset and every investor's existing holding are untouched.
+func (s *Server) delistOffering(c *gin.Context) {
 	o, err := offerings.GetByOfferingID(c.Request.Context(), c.Param("offeringId"))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 	var req struct {
-		ApprovedBy string `json:"approvedBy" binding:"required"`
+		DelistedBy string `json:"delistedBy" binding:"required"`
+		Reason     string `json:"reason" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	updated, txHash, err := offerings.Approve(c.Request.Context(), s.ce, o.ID, req.ApprovedBy)
+	updated, err := offerings.Delist(c.Request.Context(), o.ID, req.DelistedBy, req.Reason)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, offerings.ErrNotApprovable) {
+		if errors.Is(err, offerings.ErrNotListed) {
 			status = http.StatusConflict
 		}
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"offering": updated, "mintTxHash": txHash})
+	c.JSON(http.StatusOK, gin.H{"offering": updated})
 }
 
-func (s *Server) rejectOffering(c *gin.Context) {
+// relistOffering handles POST /api/v1/admin/offerings/:offeringId/relist —
+// reverses a delist.
+func (s *Server) relistOffering(c *gin.Context) {
 	o, err := offerings.GetByOfferingID(c.Request.Context(), c.Param("offeringId"))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	var req struct {
-		Reason string `json:"reason" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := offerings.Reject(c.Request.Context(), s.ce, o.ID, req.Reason); err != nil {
+	updated, err := offerings.Relist(c.Request.Context(), o.ID)
+	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, offerings.ErrNotApprovable) {
+		if errors.Is(err, offerings.ErrNotDelisted) {
 			status = http.StatusConflict
 		}
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "success"})
+	c.JSON(http.StatusOK, gin.H{"offering": updated})
 }
 
 // revalueOffering handles POST /api/v1/admin/offerings/:offeringId/revalue —

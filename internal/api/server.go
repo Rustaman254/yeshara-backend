@@ -5,6 +5,8 @@ package api
 
 import (
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -33,9 +35,9 @@ func (s *Server) Router() *gin.Engine {
 	v1 := r.Group("/api/v1")
 	{
 		v1.POST("/auth/register", s.register)
-		v1.POST("/auth/login", s.login)
+		v1.POST("/auth/login", loginRateLimit(), s.login)
 
-		v1.POST("/admin/login", s.adminLogin)
+		v1.POST("/admin/login", loginRateLimit(), s.adminLogin)
 
 		v1.GET("/offerings", s.listLiveOfferings)
 		v1.GET("/offerings/:offeringId", s.getOffering)
@@ -70,10 +72,10 @@ func (s *Server) Router() *gin.Engine {
 		{
 			admin.POST("/offerings", s.createOffering)
 			admin.GET("/offerings", s.listAllOfferings)
-			admin.POST("/offerings/:offeringId/approve", s.approveOffering)
-			admin.POST("/offerings/:offeringId/reject", s.rejectOffering)
 			admin.PATCH("/offerings/:offeringId/details", s.updateOfferingDetails)
 			admin.POST("/offerings/:offeringId/revalue", s.revalueOffering)
+			admin.POST("/offerings/:offeringId/delist", s.delistOffering)
+			admin.POST("/offerings/:offeringId/relist", s.relistOffering)
 			admin.GET("/offerings/:offeringId/investments", s.listOfferingInvestments)
 			admin.POST("/investments/:id/confirm", s.confirmInvestment)
 			admin.GET("/kyc/pending", s.listPendingKYC)
@@ -87,12 +89,39 @@ func (s *Server) Router() *gin.Engine {
 			admin.POST("/redemptions/:id/reject", s.rejectRedemption)
 			admin.POST("/redemptions/:id/mark-paid", s.markRedemptionPaid)
 			admin.PATCH("/offerings/:offeringId/owner-account", s.setOfferingOwnerAccount)
+
+			// Provisioning the four approval-chain seats — see
+			// internal/staff. Not self-service; an admin assigns them.
+			admin.POST("/staff", s.createStaffAccount)
+			admin.GET("/staff", s.listStaffAccounts)
+			admin.DELETE("/staff/:id", s.deleteStaffAccount)
+		}
+
+		// The Manager A/B -> Trustee A/B approval chain — four distinct,
+		// separately-authenticated logins (internal/staff), not four
+		// permission flags on the one shared admin secret above. See
+		// staff_handlers.go's staffReview for how segregation of duties is
+		// actually enforced (dispatch on the session's own role, not on
+		// anything the client sends).
+		staffLogin := v1.Group("/staff")
+		{
+			staffLogin.POST("/auth/login", loginRateLimit(), s.staffLogin)
+
+			staffAuthed := staffLogin.Group("")
+			staffAuthed.Use(s.requireAnyStaff)
+			{
+				staffAuthed.POST("/auth/logout", s.staffLogout)
+				staffAuthed.GET("/me", s.staffMe)
+				staffAuthed.GET("/offerings", s.staffQueue)
+				staffAuthed.POST("/offerings/:offeringId/review", s.staffReview)
+				staffAuthed.POST("/offerings/:offeringId/reject", s.staffReject)
+			}
 		}
 
 		owners := v1.Group("/owners")
 		{
 			owners.POST("/auth/register", s.ownerRegister)
-			owners.POST("/auth/login", s.ownerLogin)
+			owners.POST("/auth/login", loginRateLimit(), s.ownerLogin)
 
 			ownerAuthed := owners.Group("")
 			ownerAuthed.Use(s.requireOwner)
@@ -107,9 +136,42 @@ func (s *Server) Router() *gin.Engine {
 	return r
 }
 
+// cors mirrors comet-engine's internal/api/middleware.go: an explicit
+// origin allowlist (CORS_ALLOWED_ORIGINS, comma-separated) rather than a
+// bare "*". Low severity on its own here since auth is bearer-token/header
+// based, not cookies, but a wildcard origin is still unnecessary exposure
+// with no upside — an allowlist costs nothing once the frontend's real
+// origin is known. Falls back to permissive localhost matching only when
+// CORS_ALLOW_DEV_ORIGINS=true, same dev/prod split as comet-engine.
 func cors() gin.HandlerFunc {
+	allowed := os.Getenv("CORS_ALLOWED_ORIGINS")
+	allowDevOrigins := os.Getenv("CORS_ALLOW_DEV_ORIGINS") == "true"
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		origin := c.GetHeader("Origin")
+		switch {
+		case origin == "":
+			// Not a browser CORS request.
+		case allowed == "" && allowDevOrigins:
+			if origin == "http://localhost" || origin == "https://localhost" ||
+				origin == "http://127.0.0.1" || origin == "https://127.0.0.1" ||
+				strings.HasPrefix(origin, "http://localhost:") ||
+				strings.HasPrefix(origin, "https://localhost:") ||
+				strings.HasPrefix(origin, "http://127.0.0.1:") ||
+				strings.HasPrefix(origin, "https://127.0.0.1:") {
+				c.Header("Access-Control-Allow-Origin", origin)
+			}
+		case allowed == "":
+			// No allowlist configured and dev origins not opted into —
+			// same as comet-engine's production default: no CORS headers
+			// at all rather than a permissive fallback.
+		default:
+			for _, a := range strings.Split(allowed, ",") {
+				if strings.TrimSpace(a) == origin {
+					c.Header("Access-Control-Allow-Origin", origin)
+					break
+				}
+			}
+		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Token")
 		if c.Request.Method == http.MethodOptions {

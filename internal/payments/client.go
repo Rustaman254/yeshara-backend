@@ -147,12 +147,17 @@ type CallbackPayload struct {
 }
 
 // VerifySignature checks the X-Mamlaka-Signature header
-// ("sha256=<hex hmac>") against rawBody using constant-time comparison. If
-// secret is empty (signing isn't enabled for this account), verification is
-// skipped and this returns true.
+// ("sha256=<hex hmac>") against rawBody using constant-time comparison.
+// Fails closed: an empty secret rejects every request rather than skipping
+// verification, since the caller (mobileMoneyCallback) is a public,
+// unauthenticated endpoint that flips a payment to COMPLETE and mints
+// on-chain — the signature is the only thing standing between "Mamlaka
+// confirmed this payment" and "anyone on the internet POSTed a JSON body."
+// config.Load() also requires PaymentsCallbackSecret to be set at startup,
+// but this check exists independently in case that's ever bypassed.
 func VerifySignature(secret string, rawBody []byte, header string) bool {
 	if secret == "" {
-		return true
+		return false
 	}
 	const prefix = "sha256="
 	if !strings.HasPrefix(header, prefix) {
