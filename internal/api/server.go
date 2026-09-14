@@ -136,6 +136,15 @@ func (s *Server) Router() *gin.Engine {
 	return r
 }
 
+// defaultAllowedOrigins are known-good frontend origins allowed out of the
+// box, with no Render/hosting-dashboard configuration required — the
+// deployed marketplace frontend, specifically. CORS_ALLOWED_ORIGINS below
+// is additive on top of this list (a custom domain, a staging frontend,
+// etc.), not a replacement for it.
+var defaultAllowedOrigins = map[string]bool{
+	"https://yeshara-marketplace.vercel.app": true,
+}
+
 // cors mirrors comet-engine's internal/api/middleware.go: an explicit
 // origin allowlist (CORS_ALLOWED_ORIGINS, comma-separated) rather than a
 // bare "*". Low severity on its own here since auth is bearer-token/header
@@ -151,6 +160,8 @@ func cors() gin.HandlerFunc {
 		switch {
 		case origin == "":
 			// Not a browser CORS request.
+		case defaultAllowedOrigins[origin]:
+			c.Header("Access-Control-Allow-Origin", origin)
 		case allowed == "" && allowDevOrigins:
 			if origin == "http://localhost" || origin == "https://localhost" ||
 				origin == "http://127.0.0.1" || origin == "https://127.0.0.1" ||
