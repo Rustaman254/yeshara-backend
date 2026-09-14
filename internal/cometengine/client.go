@@ -112,10 +112,12 @@ type Receipt struct {
 	DepositorUserID  string                 `json:"depositorUserId"`
 	Status           string                 `json:"status"`
 	MintTxHash       string                 `json:"mintTxHash"`
-	// TxURL is comet-engine's ready-to-use block-explorer link for
-	// MintTxHash (built server-side from its per-chain config), empty until
-	// the receipt is minted.
-	TxURL string `json:"txUrl"`
+	// TxURL is comet-engine's ready-to-use block-explorer link for the mint
+	// transaction; AssetURL is the link to the asset/token itself (its
+	// Stellar credit-line or EVM contract page) — a different explorer page
+	// than one specific transaction. Both empty until the receipt is minted.
+	TxURL    string `json:"txUrl"`
+	AssetURL string `json:"assetUrl"`
 }
 
 // DepositOffering records a new primary-market offering as a comet-engine
@@ -143,15 +145,16 @@ func (c *Client) DepositOffering(ctx context.Context, externalUserID, chain stri
 // the depositor's wallet (Yeshara's own treasury identity) in one
 // transaction — the primary-market "shares now exist and are available to
 // sell" moment.
-func (c *Client) ApproveOffering(ctx context.Context, receiptID, verifiedBy string) (txHash, txURL string, err error) {
+func (c *Client) ApproveOffering(ctx context.Context, receiptID, verifiedBy string) (txHash, txURL, assetURL string, err error) {
 	var out struct {
-		TxHash string `json:"txHash"`
-		TxURL  string `json:"txUrl"`
+		TxHash   string `json:"txHash"`
+		TxURL    string `json:"txUrl"`
+		AssetURL string `json:"assetUrl"`
 	}
 	err = c.do(ctx, http.MethodPost, "/api/v1/tokenize/receipt/"+receiptID+"/verify", map[string]interface{}{
 		"verifiedBy": verifiedBy,
 	}, &out)
-	return out.TxHash, out.TxURL, err
+	return out.TxHash, out.TxURL, out.AssetURL, err
 }
 
 func (c *Client) RejectOffering(ctx context.Context, receiptID, reason string) error {

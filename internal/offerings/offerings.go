@@ -64,10 +64,13 @@ type Offering struct {
 	Symbol             string             `bson:"symbol,omitempty" json:"symbol,omitempty"`
 	ReceiptID          string             `bson:"receipt_id" json:"receiptId"`
 	// MintTxHash/MintTxURL are the comet-engine tx (and its ready-to-use
-	// block-explorer link) that minted this offering's units on-chain — set
-	// once, by TrusteeBTokenize. Empty until then.
+	// block-explorer link) that minted this offering's units on-chain —
+	// AssetURL is the asset/token's own explorer page (a different page
+	// than one specific transaction). All set once, by TrusteeBTokenize.
+	// Empty until then.
 	MintTxHash string `bson:"mint_tx_hash,omitempty" json:"mintTxHash,omitempty"`
 	MintTxURL  string `bson:"mint_tx_url,omitempty" json:"mintTxUrl,omitempty"`
+	AssetURL   string `bson:"asset_url,omitempty" json:"assetUrl,omitempty"`
 	IssuerUserID       string             `bson:"issuer_user_id" json:"issuerUserId"`
 	Status             Status             `bson:"status" json:"status"`
 	CreatedAt          time.Time          `bson:"created_at" json:"createdAt"`
@@ -342,7 +345,7 @@ func TrusteeBTokenize(ctx context.Context, ce *cometengine.Client, id primitive.
 	if o.Status != StatusPendingTrusteeB {
 		return nil, "", ErrWrongStage
 	}
-	txHash, txURL, err := ce.ApproveOffering(ctx, o.ReceiptID, tokenizedBy)
+	txHash, txURL, assetURL, err := ce.ApproveOffering(ctx, o.ReceiptID, tokenizedBy)
 	if err != nil {
 		return nil, "", err
 	}
@@ -367,6 +370,7 @@ func TrusteeBTokenize(ctx context.Context, ce *cometengine.Client, id primitive.
 	if txHash != "" {
 		set["mint_tx_hash"] = txHash
 		set["mint_tx_url"] = txURL
+		set["asset_url"] = assetURL
 	}
 	if reserveTxHash != "" {
 		set["reserved_units"] = reserved
