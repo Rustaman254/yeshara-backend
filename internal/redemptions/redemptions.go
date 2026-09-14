@@ -119,11 +119,18 @@ func Reject(ctx context.Context, id primitive.ObjectID, reason string) error {
 
 // MarkPaid settles a burned request's payout — the manual rail's admin
 // confirmation, or recorded automatically right after a successful
-// mpesa/onchain payout call.
+// mpesa/onchain payout call. Also reachable from StatusFailed: that's the
+// exact case MarkFailed's own doc comment describes ("an admin can retry
+// the payout (mark-paid manually...)") — an automated mpesa_b2c/onchain
+// payout that failed (e.g. treasury balance too low) doesn't mean the
+// investor never got paid, just that this system couldn't do it
+// automatically; once an admin settles it by hand, this is how that gets
+// recorded. Before this fix, a failed auto-payout was a dead end with no
+// path to StatusPaid at all.
 func MarkPaid(ctx context.Context, id primitive.ObjectID, paymentRef string) error {
 	now := time.Now().UTC()
 	res, err := collection().UpdateOne(ctx,
-		bson.M{"_id": id, "status": StatusApprovedBurned},
+		bson.M{"_id": id, "status": bson.M{"$in": []Status{StatusApprovedBurned, StatusFailed}}},
 		bson.M{"$set": bson.M{"status": StatusPaid, "payment_ref": paymentRef, "paid_at": now}},
 	)
 	if err != nil {
