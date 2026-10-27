@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -19,6 +20,10 @@ type Config struct {
 	CometEngineBaseURL string
 	CometAPIKey        string
 	CometAPISecret     string
+	// CometEngineNetwork is the engine network ("testnet" | "mainnet") every
+	// engine call is pinned to via X-Network. It must agree with the
+	// payments environment: testnet with the sandbox PSP, mainnet with live.
+	CometEngineNetwork string
 
 	// TreasuryUserID is the externalUserId comet-engine mints an approved
 	// offering's full unit supply to — the "shares available for primary
@@ -70,6 +75,7 @@ func Load() (*Config, error) {
 		CometEngineBaseURL: getEnv("COMET_ENGINE_BASE_URL", "http://localhost:8100"),
 		CometAPIKey:        os.Getenv("COMET_API_KEY"),
 		CometAPISecret:     os.Getenv("COMET_API_SECRET"),
+		CometEngineNetwork: getEnv("COMET_ENGINE_NETWORK", NetworkTestnet),
 		TreasuryUserID:     getEnv("TREASURY_USER_ID", "yeshara-treasury"),
 		AdminToken:         os.Getenv("ADMIN_TOKEN"),
 		AdminEmail:         os.Getenv("ADMIN_EMAIL"),
@@ -103,6 +109,14 @@ func Load() (*Config, error) {
 		// environment, not just recommended.
 		return nil, fmt.Errorf("PAYMENTS_CALLBACK_SECRET is required (verifies inbound mobile-money callbacks — without it, anyone can forge a payment confirmation)")
 	}
+	network, ok := NormalizeNetwork(cfg.CometEngineNetwork)
+	if !ok {
+		return nil, fmt.Errorf("COMET_ENGINE_NETWORK must be testnet or mainnet, got %q", cfg.CometEngineNetwork)
+	}
+	cfg.CometEngineNetwork = network
+	if err := checkEnvironmentsMatch(network, cfg.PaymentsBaseURL); err != nil {
+		return nil, err
+	}
 	if v := os.Getenv("USD_KES_RATE"); v != "" {
 		rate, err := strconv.ParseFloat(v, 64)
 		if err != nil {
@@ -111,4 +125,36 @@ func Load() (*Config, error) {
 		cfg.USDKESRate = rate
 	}
 	return cfg, nil
+}
+
+// Engine networks, as comet-engine names them.
+const (
+	NetworkTestnet = "testnet"
+	NetworkMainnet = "mainnet"
+)
+
+// NormalizeNetwork accepts the spellings comet-engine accepts (test,
+// sandbox, prod, production, live, ...) and returns testnet or mainnet.
+func NormalizeNetwork(v string) (string, bool) {
+	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(v), " ", "")) {
+	case "testnet", "test", "sandbox", "testing":
+		return NetworkTestnet, true
+	case "mainnet", "main", "prod", "production", "live":
+		return NetworkMainnet, true
+	}
+	return "", false
+}
+
+// checkEnvironmentsMatch refuses a mixed deployment: minting real units on
+// mainnet against sandbox (fake) M-Pesa payments, or charging investors
+// real money for testnet units.
+func checkEnvironmentsMatch(network, paymentsBaseURL string) error {
+	sandbox := strings.Contains(strings.ToLower(paymentsBaseURL), "sandbox")
+	switch {
+	case network == NetworkMainnet && sandbox:
+		return fmt.Errorf("COMET_ENGINE_NETWORK=mainnet but PAYMENTS_BASE_URL is the sandbox (%s): set the live payments URL, or use testnet", paymentsBaseURL)
+	case network == NetworkTestnet && !sandbox:
+		return fmt.Errorf("COMET_ENGINE_NETWORK=testnet but PAYMENTS_BASE_URL is not the sandbox (%s): investors would pay real money for testnet units", paymentsBaseURL)
+	}
+	return nil
 }

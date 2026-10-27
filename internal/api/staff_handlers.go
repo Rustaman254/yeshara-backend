@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 
+	"yeshara.network/marketplace/internal/cometengine"
 	"yeshara.network/marketplace/internal/offerings"
 	"yeshara.network/marketplace/internal/staff"
 )
@@ -171,6 +172,13 @@ func (s *Server) staffReview(c *gin.Context) {
 		return
 	}
 	if reviewErr != nil {
+		var pending *cometengine.PendingApprovalError
+		if errors.As(reviewErr, &pending) {
+			// Held by comet-engine's maker-checker: tokenize again once its
+			// signers have approved and the offering is recorded as live.
+			c.JSON(http.StatusAccepted, gin.H{"status": "pending_approval", "approvalId": pending.ApprovalID, "message": reviewErr.Error()})
+			return
+		}
 		status := http.StatusInternalServerError
 		if errors.Is(reviewErr, offerings.ErrWrongStage) {
 			status = http.StatusConflict

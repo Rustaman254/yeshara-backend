@@ -22,7 +22,7 @@ type Server struct {
 func NewServer(cfg *config.Config) *Server {
 	return &Server{
 		cfg: cfg,
-		ce:  cometengine.New(cfg.CometEngineBaseURL, cfg.CometAPIKey, cfg.CometAPISecret),
+		ce:  cometengine.New(cfg.CometEngineBaseURL, cfg.CometAPIKey, cfg.CometAPISecret, cfg.CometEngineNetwork),
 	}
 }
 
@@ -76,6 +76,8 @@ func (s *Server) Router() *gin.Engine {
 			admin.POST("/offerings/:offeringId/revalue", s.revalueOffering)
 			admin.POST("/offerings/:offeringId/delist", s.delistOffering)
 			admin.POST("/offerings/:offeringId/relist", s.relistOffering)
+			admin.POST("/offerings/:offeringId/remove", s.removeOffering)
+			admin.POST("/offerings/:offeringId/shariah-certification", s.certifyShariahOffering)
 			admin.GET("/offerings/:offeringId/investments", s.listOfferingInvestments)
 			admin.POST("/investments/:id/confirm", s.confirmInvestment)
 			admin.GET("/kyc/pending", s.listPendingKYC)

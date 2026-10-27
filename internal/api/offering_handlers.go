@@ -8,6 +8,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 
+	"yeshara.network/marketplace/internal/cometengine"
+	"yeshara.network/marketplace/internal/investments"
 	"yeshara.network/marketplace/internal/offerings"
 )
 
@@ -30,9 +32,13 @@ func (s *Server) listLiveOfferings(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	shariahOnly := c.Query("shariah") == "true"
 
 	out := make([]liveOffering, 0, len(list))
 	for _, o := range list {
+		if shariahOnly && o.Shariah == nil {
+			continue
+		}
 		lo := liveOffering{Offering: o}
 		if available, err := s.ce.AssetBalance(c.Request.Context(), o.Symbol, o.Chain, s.cfg.TreasuryUserID); err == nil {
 			// publicPool excludes whatever went to the owner's reserve at
@@ -111,6 +117,10 @@ func (s *Server) createOffering(c *gin.Context) {
 		ExpectedYieldPct   float64           `json:"expectedYieldPct"`
 		RiskLevel          string            `json:"riskLevel"`
 		Details            offerings.Details `json:"details"`
+		// Shariah makes this a Shariah-compliant offering. The engine
+		// screens it at once (structure, sector, debt and income ratios);
+		// the board's certificate can follow before Trustee B tokenizes.
+		Shariah *cometengine.ShariahProfile `json:"shariah"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -126,11 +136,16 @@ func (s *Server) createOffering(c *gin.Context) {
 		Chain:        "stellar", // primary market is Stellar-only for now
 		IssuerUserID: s.cfg.TreasuryUserID,
 		Details:      req.Details,
+		Shariah:      req.Shariah,
 	})
 	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, offerings.ErrSlugTaken) {
+		var apiErr *cometengine.APIError
+		switch {
+		case errors.Is(err, offerings.ErrSlugTaken):
 			status = http.StatusConflict
+		case errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnprocessableEntity:
+			status = http.StatusUnprocessableEntity // failed Shariah screening
 		}
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
@@ -263,4 +278,70 @@ func (s *Server) offeringObjectID(c *gin.Context) (primitive.ObjectID, *offering
 		return primitive.NilObjectID, nil, err
 	}
 	return o.ID, o, nil
+}
+
+// removeOffering handles POST /api/v1/admin/offerings/:offeringId/remove —
+// retires a tokenized (live or delisted) offering. Refused with 409 while
+// investors hold units or payments are pending; otherwise the remaining
+// treasury and owner-reserve units are burned on the engine.
+func (s *Server) removeOffering(c *gin.Context) {
+	ctx := c.Request.Context()
+	o, err := offerings.GetByOfferingID(ctx, c.Param("offeringId"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	var req struct {
+		RemovedBy string `json:"removedBy" binding:"required"`
+		Reason    string `json:"reason" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	pending, err := investments.ListByOffering(ctx, o.ID, string(investments.StatusPendingPayment))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	removed, err := offerings.Remove(ctx, s.ce, o.ID, s.cfg.TreasuryUserID, req.RemovedBy, req.Reason, len(pending))
+	var holdErr *offerings.InvestorsHoldError
+	switch {
+	case err == nil:
+		c.JSON(http.StatusOK, gin.H{"offering": removed})
+	case errors.As(err, &holdErr):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "investorUnits": holdErr.Units})
+	case errors.Is(err, offerings.ErrNotRemovable), errors.Is(err, offerings.ErrPendingPayments):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+	}
+}
+
+// certifyShariahOffering handles POST /api/v1/admin/offerings/:offeringId/shariah-certification
+// — records the Shariah board's certificate, required before tokenizing.
+func (s *Server) certifyShariahOffering(c *gin.Context) {
+	ctx := c.Request.Context()
+	o, err := offerings.GetByOfferingID(ctx, c.Param("offeringId"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	var cert cometengine.ShariahCertification
+	if err := c.ShouldBindJSON(&cert); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	updated, err := offerings.CertifyShariah(ctx, s.ce, o.ID, cert)
+	var apiErr *cometengine.APIError
+	switch {
+	case err == nil:
+		c.JSON(http.StatusOK, gin.H{"offering": updated})
+	case errors.Is(err, offerings.ErrNotShariah), errors.Is(err, offerings.ErrWrongStage):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	case errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnprocessableEntity:
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": apiErr.Message})
+	default:
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+	}
 }

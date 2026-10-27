@@ -191,7 +191,7 @@ func (s *Server) approveRedemption(c *gin.Context) {
 	switch r.PayoutMethod {
 	case distributions.PayoutOnchain:
 		payouts := []cometengine.Payout{{ExternalUserID: inv.ExternalUserID(), Amount: r.PayoutAmount}}
-		payoutResult, err := s.ce.Distribute(ctx, o.ReceiptID, r.PayoutAssetSymbol, r.ID.Hex(), payouts)
+		payoutResult, err := s.ce.Distribute(ctx, o.ReceiptID, r.PayoutAssetSymbol, r.ID.Hex(), "capital_return", payouts) // paying an investor back for units they redeemed
 		if err != nil {
 			_ = redemptions.MarkFailed(ctx, id, err.Error())
 		} else if len(payoutResult.Results) > 0 && payoutResult.Results[0].Error == "" {

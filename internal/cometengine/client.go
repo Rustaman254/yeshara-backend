@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,17 +21,26 @@ type Client struct {
 	baseURL    string
 	apiKey     string
 	apiSecret  string
+	network    string
 	httpClient *http.Client
 }
 
-func New(baseURL, apiKey, apiSecret string) *Client {
+// New builds a client pinned to one engine network ("testnet" or
+// "mainnet"), sent as X-Network on every call so Yeshara's offerings,
+// mints and balances always land on the network this deployment is
+// configured for, never on whatever the engine happens to default to.
+func New(baseURL, apiKey, apiSecret, network string) *Client {
 	return &Client{
 		baseURL:    baseURL,
 		apiKey:     apiKey,
 		apiSecret:  apiSecret,
+		network:    network,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
+
+// Network is the engine network this client is pinned to.
+func (c *Client) Network() string { return c.network }
 
 // APIError is returned when comet-engine responds with a non-2xx status —
 // callers can surface Message directly, it's already meant for an API
@@ -42,6 +52,19 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("comet-engine: %d: %s", e.StatusCode, e.Message)
+}
+
+// PendingApprovalError means comet-engine's maker-checker held the action
+// for its approval policy (HTTP 202): nothing happened yet, so callers must
+// not treat it as success. It runs once the policy's signers approve.
+type PendingApprovalError struct {
+	ApprovalID  string
+	ActionScope string
+	Threshold   int
+}
+
+func (e *PendingApprovalError) Error() string {
+	return fmt.Sprintf("comet-engine: %s is awaiting %d approval(s) (approval %s)", e.ActionScope, e.Threshold, e.ApprovalID)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body interface{}, out interface{}) error {
@@ -61,6 +84,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", c.apiKey)
 	req.Header.Set("X-API-Secret", c.apiSecret)
+	if c.network != "" {
+		req.Header.Set("X-Network", c.network)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -88,6 +114,18 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 		return &APIError{StatusCode: resp.StatusCode, Message: msg}
 	}
 
+	if resp.StatusCode == http.StatusAccepted {
+		var pending struct {
+			Status      string `json:"status"`
+			ApprovalID  string `json:"approvalId"`
+			ActionScope string `json:"actionScope"`
+			Threshold   int    `json:"threshold"`
+		}
+		if json.Unmarshal(respBody, &pending) == nil && pending.Status == "pending_approval" {
+			return &PendingApprovalError{ApprovalID: pending.ApprovalID, ActionScope: pending.ActionScope, Threshold: pending.Threshold}
+		}
+	}
+
 	if out != nil {
 		if err := json.Unmarshal(respBody, out); err != nil {
 			return fmt.Errorf("decode response: %w", err)
@@ -99,19 +137,22 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 // ── Receipts (offerings) ────────────────────────────────────────────────
 
 type Receipt struct {
-	ID               string                 `json:"id"`
-	StandardCode     string                 `json:"standardCode"`
-	Symbol           string                 `json:"symbol"`
-	Chain            string                 `json:"chain"`
-	Identifier       string                 `json:"identifier"`
-	Attributes       map[string]interface{} `json:"attributes"`
-	Quantity         float64                `json:"quantity"`
-	QuantityUnit     string                 `json:"quantityUnit"`
-	Decimals         int                    `json:"decimals"`
-	RedeemedQuantity float64                `json:"redeemedQuantity"`
-	DepositorUserID  string                 `json:"depositorUserId"`
-	Status           string                 `json:"status"`
-	MintTxHash       string                 `json:"mintTxHash"`
+	ID                 string                 `json:"id"`
+	StandardCode       string                 `json:"standardCode"`
+	Symbol             string                 `json:"symbol"`
+	Chain              string                 `json:"chain"`
+	Identifier         string                 `json:"identifier"`
+	Attributes         map[string]interface{} `json:"attributes"`
+	Quantity           float64                `json:"quantity"`
+	QuantityUnit       string                 `json:"quantityUnit"`
+	Decimals           int                    `json:"decimals"`
+	RedeemedQuantity   float64                `json:"redeemedQuantity"`
+	ClawedBackQuantity float64                `json:"clawedBackQuantity"`
+	Network            string                 `json:"network"`
+	Shariah            *ShariahProfile        `json:"shariah,omitempty"`
+	DepositorUserID    string                 `json:"depositorUserId"`
+	Status             string                 `json:"status"`
+	MintTxHash         string                 `json:"mintTxHash"`
 	// TxURL is comet-engine's ready-to-use block-explorer link for the mint
 	// transaction; AssetURL is the link to the asset/token itself (its
 	// Stellar credit-line or EVM contract page) — a different explorer page
@@ -120,21 +161,62 @@ type Receipt struct {
 	AssetURL string `json:"assetUrl"`
 }
 
+// Outstanding is the receipt's units still in circulation.
+func (r *Receipt) Outstanding() float64 {
+	return r.Quantity - r.RedeemedQuantity - r.ClawedBackQuantity
+}
+
+// The two engine standards Yeshara deposits under. A Shariah offering
+// lives in its own standard, which the engine keeps as a separate pool
+// (own journal accounts, certificate required before minting).
+const (
+	PrimaryStandard = "YESHARA_PRIMARY_OFFERING"
+	ShariahStandard = "YESHARA_SHARIAH_OFFERING"
+)
+
+// ShariahProfile mirrors comet-engine's shariah.Profile.
+type ShariahProfile struct {
+	Structure          string                `json:"structure" bson:"structure"`
+	Sector             string                `json:"sector" bson:"sector"`
+	DebtToAssets       *float64              `json:"debtToAssets,omitempty" bson:"debt_to_assets,omitempty"`
+	ImpermissibleRatio *float64              `json:"impermissibleRatio,omitempty" bson:"impermissible_ratio,omitempty"`
+	PurificationRatio  float64               `json:"purificationRatio,omitempty" bson:"purification_ratio,omitempty"`
+	Certification      *ShariahCertification `json:"certification,omitempty" bson:"certification,omitempty"`
+}
+
+// ShariahCertification is the Shariah board's certificate for one offering.
+type ShariahCertification struct {
+	Board          string    `json:"board" bson:"board"`
+	CertificateRef string    `json:"certificateRef" bson:"certificate_ref"`
+	Scholars       []string  `json:"scholars,omitempty" bson:"scholars,omitempty"`
+	IssuedAt       time.Time `json:"issuedAt" bson:"issued_at"`
+	ExpiresAt      time.Time `json:"expiresAt" bson:"expires_at"`
+	DocumentURL    string    `json:"documentUrl,omitempty" bson:"document_url,omitempty"`
+}
+
 // DepositOffering records a new primary-market offering as a comet-engine
-// receipt under the YESHARA_PRIMARY_OFFERING standard — no units exist
-// on-chain until ApproveOffering verifies it.
-func (c *Client) DepositOffering(ctx context.Context, externalUserID, chain string, attributes map[string]interface{}) (*Receipt, error) {
+// receipt — under the Shariah standard when shariah is set, otherwise the
+// primary one. No units exist on-chain until ApproveOffering verifies it.
+func (c *Client) DepositOffering(ctx context.Context, externalUserID, chain string, attributes map[string]interface{}, shariah *ShariahProfile) (*Receipt, error) {
 	var out struct {
 		ID     string `json:"id"`
 		Symbol string `json:"symbol"`
 		Status string `json:"status"`
 	}
-	err := c.do(ctx, http.MethodPost, "/api/v1/tokenize/receipt/deposit", map[string]interface{}{
+	body := map[string]interface{}{
 		"externalUserId": externalUserID,
-		"standardCode":   "YESHARA_PRIMARY_OFFERING",
+		"standardCode":   PrimaryStandard,
 		"chain":          chain,
 		"attributes":     attributes,
-	}, &out)
+	}
+	if shariah != nil {
+		if err := c.EnsureShariahStandard(ctx); err != nil {
+			return nil, err
+		}
+		body["standardCode"] = ShariahStandard
+		body["shariah"] = shariah
+	}
+	err := c.do(ctx, http.MethodPost, "/api/v1/tokenize/receipt/deposit", body, &out)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +239,52 @@ func (c *Client) ApproveOffering(ctx context.Context, receiptID, verifiedBy stri
 	return out.TxHash, out.TxURL, out.AssetURL, err
 }
 
+// CertifyShariah attaches the board's certificate to a Shariah offering's
+// receipt; the engine refuses to mint it without one.
+func (c *Client) CertifyShariah(ctx context.Context, receiptID string, cert ShariahCertification) (*Receipt, error) {
+	var r Receipt
+	if err := c.do(ctx, http.MethodPost, "/api/v1/tokenize/receipt/"+receiptID+"/shariah/certification", cert, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// EnsureShariahStandard creates YESHARA_SHARIAH_OFFERING on the engine if
+// it doesn't exist yet, with the same fields as the primary standard so
+// both kinds of offering carry identical attributes.
+func (c *Client) EnsureShariahStandard(ctx context.Context) error {
+	var existing map[string]interface{}
+	err := c.do(ctx, http.MethodGet, "/api/v1/tokenize/receipt/standards/"+ShariahStandard, nil, &existing)
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return err
+	}
+	var primary map[string]interface{}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/tokenize/receipt/standards/"+PrimaryStandard, nil, &primary); err != nil {
+		return fmt.Errorf("read %s to copy its fields: %w", PrimaryStandard, err)
+	}
+	body := map[string]interface{}{
+		"code":                ShariahStandard,
+		"name":                "Yeshara Shariah-compliant offering",
+		"description":         "Shariah-compliant primary offerings, kept as a separate pool",
+		"symbolPrefix":        primary["symbolPrefix"],
+		"quantityUnit":        primary["quantityUnit"],
+		"decimals":            primary["decimals"],
+		"chain":               primary["chain"],
+		"requireVerification": true,
+		"fields":              primary["fields"],
+		"shariah":             true,
+	}
+	err = c.do(ctx, http.MethodPost, "/api/v1/tokenize/receipt/standards", body, nil)
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
+		return nil // created concurrently
+	}
+	return err
+}
+
 func (c *Client) RejectOffering(ctx context.Context, receiptID, reason string) error {
 	return c.do(ctx, http.MethodPost, "/api/v1/tokenize/receipt/"+receiptID+"/reject", map[string]interface{}{
 		"reason": reason,
@@ -172,7 +300,7 @@ func (c *Client) GetReceipt(ctx context.Context, receiptID string) (*Receipt, er
 }
 
 func (c *Client) ListReceipts(ctx context.Context, status string) ([]Receipt, error) {
-	path := "/api/v1/tokenize/receipt?standardCode=YESHARA_PRIMARY_OFFERING"
+	path := "/api/v1/tokenize/receipt?standardCode=" + PrimaryStandard
 	if status != "" {
 		path += "&status=" + status
 	}
@@ -247,6 +375,8 @@ type DistributeResult struct {
 	PayoutSymbol     string         `json:"payoutSymbol"`
 	TotalDistributed float64        `json:"totalDistributed"`
 	Results          []PayoutResult `json:"results"`
+	// Set for Shariah receipts: what the issuer owes charity (purification).
+	PurificationAmount float64 `json:"purificationAmount,omitempty"`
 }
 
 // Distribute pays a batch of holders from a receipt's income — rental,
@@ -254,12 +384,17 @@ type DistributeResult struct {
 // already be a registered asset on the receipt's chain; comet-engine mints
 // it fresh to each recipient, no pre-funded balance required on Yeshara's
 // side. Per-payout failures are isolated in Results, not fatal to the batch.
-func (c *Client) Distribute(ctx context.Context, receiptID, payoutSymbol, externalID string, payouts []Payout) (*DistributeResult, error) {
+//
+// distributionType says what the payout is (rental, profit_share,
+// sale_proceeds, capital_return); the engine requires it for Shariah
+// receipts and refuses anything that is a fixed or guaranteed return.
+func (c *Client) Distribute(ctx context.Context, receiptID, payoutSymbol, externalID, distributionType string, payouts []Payout) (*DistributeResult, error) {
 	var out DistributeResult
 	err := c.do(ctx, http.MethodPost, "/api/v1/tokenize/receipt/"+receiptID+"/distribute", map[string]interface{}{
-		"payoutSymbol": payoutSymbol,
-		"payouts":      payouts,
-		"externalId":   externalID,
+		"payoutSymbol":     payoutSymbol,
+		"payouts":          payouts,
+		"externalId":       externalID,
+		"distributionType": distributionType,
 	}, &out)
 	return &out, err
 }

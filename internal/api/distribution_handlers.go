@@ -31,9 +31,20 @@ func (s *Server) triggerDistribution(c *gin.Context) {
 		PayoutMethod      string  `json:"payoutMethod" binding:"required"`
 		PayoutAssetSymbol string  `json:"payoutAssetSymbol"`
 		CreatedBy         string  `json:"createdBy" binding:"required"`
+		// DistributionType is what the payout is; Yeshara distributes
+		// property income, so it defaults to rental. A Shariah offering
+		// accepts only rental, profit_share, sale_proceeds or capital_return.
+		DistributionType string `json:"distributionType"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.DistributionType == "" {
+		req.DistributionType = "rental"
+	}
+	if err := o.CheckDistributionType(req.DistributionType); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
 	method := distributions.PayoutMethod(req.PayoutMethod)
@@ -69,7 +80,7 @@ func (s *Server) triggerDistribution(c *gin.Context) {
 			payouts = append(payouts, cometengine.Payout{ExternalUserID: inv.ExternalUserID(), Amount: e.Amount})
 			byExternalID[inv.ExternalUserID()] = e.ID
 		}
-		result, err := s.ce.Distribute(ctx, o.ReceiptID, req.PayoutAssetSymbol, dist.ID.Hex(), payouts)
+		result, err := s.ce.Distribute(ctx, o.ReceiptID, req.PayoutAssetSymbol, dist.ID.Hex(), req.DistributionType, payouts)
 		if err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"error": "comet-engine distribute failed", "details": err.Error(), "distribution": dist})
 			return

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -39,6 +40,9 @@ const (
 	StatusLive            Status = "live"              // Trustee B minted — units exist on-chain, open for investment
 	StatusRejected        Status = "rejected"
 	StatusClosed          Status = "closed" // manually closed or fully sold
+	// StatusRemoved: retired from the platform. Every unit was burned on the
+	// engine (only possible once no investor holds any); kept for audit.
+	StatusRemoved Status = "removed"
 )
 
 // PendingStatuses is every status a staff review action can still move —
@@ -68,13 +72,13 @@ type Offering struct {
 	// AssetURL is the asset/token's own explorer page (a different page
 	// than one specific transaction). All set once, by TrusteeBTokenize.
 	// Empty until then.
-	MintTxHash string `bson:"mint_tx_hash,omitempty" json:"mintTxHash,omitempty"`
-	MintTxURL  string `bson:"mint_tx_url,omitempty" json:"mintTxUrl,omitempty"`
-	AssetURL   string `bson:"asset_url,omitempty" json:"assetUrl,omitempty"`
-	IssuerUserID       string             `bson:"issuer_user_id" json:"issuerUserId"`
-	Status             Status             `bson:"status" json:"status"`
-	CreatedAt          time.Time          `bson:"created_at" json:"createdAt"`
-	UpdatedAt          time.Time          `bson:"updated_at" json:"updatedAt"`
+	MintTxHash   string    `bson:"mint_tx_hash,omitempty" json:"mintTxHash,omitempty"`
+	MintTxURL    string    `bson:"mint_tx_url,omitempty" json:"mintTxUrl,omitempty"`
+	AssetURL     string    `bson:"asset_url,omitempty" json:"assetUrl,omitempty"`
+	IssuerUserID string    `bson:"issuer_user_id" json:"issuerUserId"`
+	Status       Status    `bson:"status" json:"status"`
+	CreatedAt    time.Time `bson:"created_at" json:"createdAt"`
+	UpdatedAt    time.Time `bson:"updated_at" json:"updatedAt"`
 
 	// OwnerUserID/ReservedUnits/ReserveTxHash record the on-approval transfer
 	// that sets aside ReservedOwnerPct of TotalUnits for the real-world
@@ -94,14 +98,14 @@ type Offering struct {
 	// Approval-chain audit trail — who (by staff email) cleared each stage
 	// and when. Populated one field at a time as the offering moves through
 	// ManagerAReview -> ManagerBReview -> TrusteeAApprove -> TrusteeBTokenize.
-	ManagerAReviewedBy   string     `bson:"manager_a_reviewed_by,omitempty" json:"managerAReviewedBy,omitempty"`
-	ManagerAReviewedAt   *time.Time `bson:"manager_a_reviewed_at,omitempty" json:"managerAReviewedAt,omitempty"`
-	ManagerBReviewedBy   string     `bson:"manager_b_reviewed_by,omitempty" json:"managerBReviewedBy,omitempty"`
-	ManagerBReviewedAt   *time.Time `bson:"manager_b_reviewed_at,omitempty" json:"managerBReviewedAt,omitempty"`
-	TrusteeAApprovedBy   string     `bson:"trustee_a_approved_by,omitempty" json:"trusteeAApprovedBy,omitempty"`
-	TrusteeAApprovedAt   *time.Time `bson:"trustee_a_approved_at,omitempty" json:"trusteeAApprovedAt,omitempty"`
-	TrusteeBTokenizedBy  string     `bson:"trustee_b_tokenized_by,omitempty" json:"trusteeBTokenizedBy,omitempty"`
-	TrusteeBTokenizedAt  *time.Time `bson:"trustee_b_tokenized_at,omitempty" json:"trusteeBTokenizedAt,omitempty"`
+	ManagerAReviewedBy  string     `bson:"manager_a_reviewed_by,omitempty" json:"managerAReviewedBy,omitempty"`
+	ManagerAReviewedAt  *time.Time `bson:"manager_a_reviewed_at,omitempty" json:"managerAReviewedAt,omitempty"`
+	ManagerBReviewedBy  string     `bson:"manager_b_reviewed_by,omitempty" json:"managerBReviewedBy,omitempty"`
+	ManagerBReviewedAt  *time.Time `bson:"manager_b_reviewed_at,omitempty" json:"managerBReviewedAt,omitempty"`
+	TrusteeAApprovedBy  string     `bson:"trustee_a_approved_by,omitempty" json:"trusteeAApprovedBy,omitempty"`
+	TrusteeAApprovedAt  *time.Time `bson:"trustee_a_approved_at,omitempty" json:"trusteeAApprovedAt,omitempty"`
+	TrusteeBTokenizedBy string     `bson:"trustee_b_tokenized_by,omitempty" json:"trusteeBTokenizedBy,omitempty"`
+	TrusteeBTokenizedAt *time.Time `bson:"trustee_b_tokenized_at,omitempty" json:"trusteeBTokenizedAt,omitempty"`
 
 	// RejectedBy/RejectedStage/RejectedReason record who killed the
 	// submission and at which desk it was sitting when they did — any of
@@ -117,6 +121,19 @@ type Offering struct {
 	DelistedBy     string     `bson:"delisted_by,omitempty" json:"delistedBy,omitempty"`
 	DelistedAt     *time.Time `bson:"delisted_at,omitempty" json:"delistedAt,omitempty"`
 	DelistedReason string     `bson:"delisted_reason,omitempty" json:"delistedReason,omitempty"`
+
+	// Shariah is set for Shariah-compliant offerings, which live in the
+	// engine's separate YESHARA_SHARIAH_OFFERING pool and can only be
+	// tokenized once the Shariah board's certificate is attached.
+	Shariah *cometengine.ShariahProfile `bson:"shariah,omitempty" json:"shariah,omitempty"`
+
+	// Network is the engine network the offering was tokenized on.
+	Network string `bson:"network,omitempty" json:"network,omitempty"`
+
+	RemovedBy      string     `bson:"removed_by,omitempty" json:"removedBy,omitempty"`
+	RemovedAt      *time.Time `bson:"removed_at,omitempty" json:"removedAt,omitempty"`
+	RemovedReason  string     `bson:"removed_reason,omitempty" json:"removedReason,omitempty"`
+	RemovalBurnTxs []string   `bson:"removal_burn_txs,omitempty" json:"removalBurnTxs,omitempty"`
 
 	Details Details `bson:"details,omitempty" json:"details,omitempty"`
 }
@@ -215,6 +232,8 @@ type CreateInput struct {
 	Chain              string // Stellar-only for now — validated by the caller (HTTP handler)
 	IssuerUserID       string
 	Details            Details
+	// Shariah makes this a Shariah-compliant offering (separate pool).
+	Shariah *cometengine.ShariahProfile
 }
 
 // Create deposits the offering as a comet-engine receipt (pending_approval
@@ -231,7 +250,7 @@ func Create(ctx context.Context, ce *cometengine.Client, in CreateInput) (*Offer
 		"currency":           in.Currency,
 		"minInvestmentUnits": in.MinInvestmentUnits,
 		"imageUrl":           in.ImageURL,
-	})
+	}, in.Shariah)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +264,7 @@ func Create(ctx context.Context, ce *cometengine.Client, in CreateInput) (*Offer
 		RiskLevel: in.RiskLevel, Chain: in.Chain,
 		Symbol: receipt.Symbol, ReceiptID: receipt.ID, IssuerUserID: in.IssuerUserID,
 		Status: StatusPendingManagerA, CreatedAt: now, UpdatedAt: now,
-		Details: in.Details,
+		Details: in.Details, Shariah: receipt.Shariah, Network: ce.Network(),
 	}
 	res, err := collection().InsertOne(ctx, o)
 	if err != nil {
@@ -345,8 +364,17 @@ func TrusteeBTokenize(ctx context.Context, ce *cometengine.Client, id primitive.
 	if o.Status != StatusPendingTrusteeB {
 		return nil, "", ErrWrongStage
 	}
-	txHash, txURL, assetURL, err := ce.ApproveOffering(ctx, o.ReceiptID, tokenizedBy)
+	// If the engine held the first attempt for maker-checker approval and
+	// its signers have since approved, the receipt is already minted:
+	// finish recording it instead of verifying (and failing) again.
+	var txHash, txURL, assetURL string
+	receipt, err := ce.GetReceipt(ctx, o.ReceiptID)
 	if err != nil {
+		return nil, "", err
+	}
+	if receipt.Status == "active" || receipt.Status == "partially_redeemed" {
+		txHash, txURL, assetURL = receipt.MintTxHash, receipt.TxURL, receipt.AssetURL
+	} else if txHash, txURL, assetURL, err = ce.ApproveOffering(ctx, o.ReceiptID, tokenizedBy); err != nil {
 		return nil, "", err
 	}
 
@@ -582,4 +610,133 @@ func List(ctx context.Context, status string) ([]Offering, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// ── Shariah ─────────────────────────────────────────────────────────────
+
+var ErrNotShariah = errors.New("offerings: not a Shariah offering")
+
+// ShariahDistributionTypes are the payout kinds a Shariah offering may make
+// (mirrors comet-engine's shariah package). Anything that is a fixed or
+// guaranteed return on capital is riba.
+var ShariahDistributionTypes = []string{"rental", "profit_share", "sale_proceeds", "capital_return"}
+
+// CheckDistributionType refuses a non-permitted payout kind on a Shariah
+// offering; conventional offerings accept any label.
+func (o *Offering) CheckDistributionType(kind string) error {
+	if o.Shariah == nil {
+		return nil
+	}
+	if slices.Contains(ShariahDistributionTypes, kind) {
+		return nil
+	}
+	return fmt.Errorf("%q is not permitted for a Shariah offering (use one of %v)", kind, ShariahDistributionTypes)
+}
+
+// CertifyShariah attaches the Shariah board's certificate on the engine and
+// mirrors it locally. Only before tokenization: the engine checks it when
+// Trustee B mints.
+func CertifyShariah(ctx context.Context, ce *cometengine.Client, id primitive.ObjectID, cert cometengine.ShariahCertification) (*Offering, error) {
+	o, err := Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if o.Shariah == nil {
+		return nil, ErrNotShariah
+	}
+	if !slices.Contains(PendingStatuses, o.Status) {
+		return nil, ErrWrongStage
+	}
+	r, err := ce.CertifyShariah(ctx, o.ReceiptID, cert)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := collection().UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{
+		"shariah": r.Shariah, "updated_at": time.Now().UTC(),
+	}}); err != nil {
+		return nil, err
+	}
+	return Get(ctx, id)
+}
+
+// ── Removal ─────────────────────────────────────────────────────────────
+
+var (
+	ErrNotRemovable    = errors.New("offerings: only a live or closed (delisted) offering can be removed; reject a pending one instead")
+	ErrPendingPayments = errors.New("offerings: investments are still awaiting payment")
+)
+
+// InvestorsHoldError means investors still own units, so the offering
+// can't be removed until their redemptions are processed.
+type InvestorsHoldError struct{ Units float64 }
+
+func (e *InvestorsHoldError) Error() string {
+	return fmt.Sprintf("offerings: investors still hold %.2f units; process their redemptions first", e.Units)
+}
+
+// Remove retires a tokenized offering. It refuses while any investor holds
+// units or any payment is pending, then burns what is left in Yeshara's
+// treasury and the owner's reserve through the engine (the receipt ends
+// "redeemed") and marks the offering removed. Safe to retry: balances are
+// re-read every time, so units already burned are never burned twice.
+func Remove(ctx context.Context, ce *cometengine.Client, id primitive.ObjectID, treasuryUserID, removedBy, reason string, pendingPayments int) (*Offering, error) {
+	o, err := Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if o.Status != StatusLive && o.Status != StatusClosed {
+		return nil, ErrNotRemovable
+	}
+	if pendingPayments > 0 {
+		return nil, fmt.Errorf("%w (%d)", ErrPendingPayments, pendingPayments)
+	}
+
+	receipt, err := ce.GetReceipt(ctx, o.ReceiptID)
+	if err != nil {
+		return nil, err
+	}
+	holders := []string{treasuryUserID}
+	if o.OwnerUserID != "" && o.OwnerUserID != treasuryUserID {
+		holders = append(holders, o.OwnerUserID)
+	}
+	balances := make([]float64, len(holders))
+	var platformHeld float64
+	for i, h := range holders {
+		if balances[i], err = ce.AssetBalance(ctx, o.Symbol, o.Chain, h); err != nil {
+			return nil, err
+		}
+		platformHeld += balances[i]
+	}
+	// Units are 2-decimal; anything under half a hundredth is rounding.
+	if investorHeld := receipt.Outstanding() - platformHeld; investorHeld > 0.005 {
+		return nil, &InvestorsHoldError{Units: investorHeld}
+	}
+
+	var burnTxs []string
+	for i, h := range holders {
+		if balances[i] <= 0 {
+			continue
+		}
+		res, err := ce.Redeem(ctx, o.ReceiptID, h, fmt.Sprintf("remove-%s-%d", o.OfferingID, i), balances[i])
+		if err != nil {
+			return nil, fmt.Errorf("burn %s's %.2f units: %w", h, balances[i], err)
+		}
+		burnTxs = append(burnTxs, res.TxHash)
+	}
+
+	now := time.Now().UTC()
+	res, err := collection().UpdateOne(ctx,
+		bson.M{"_id": id, "status": bson.M{"$in": []Status{StatusLive, StatusClosed}}},
+		bson.M{"$set": bson.M{
+			"status": StatusRemoved, "updated_at": now,
+			"removed_by": removedBy, "removed_at": now, "removed_reason": reason,
+		}, "$push": bson.M{"removal_burn_txs": bson.M{"$each": burnTxs}}},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if res.MatchedCount == 0 {
+		return nil, ErrNotRemovable
+	}
+	return Get(ctx, id)
 }
